@@ -617,6 +617,259 @@ ssl_cert_issue() {
 
     return 0
 }
+
+install_cloudflared() {
+    if command -v cloudflared &> /dev/null; then
+        return 0
+    fi
+    echo -e "${yellow}Downloading & installing Cloudflare Tunnel (cloudflared)...${plain}"
+    local cf_arch=""
+    case "$(uname -m)" in
+        x86_64 | amd64) cf_arch="amd64" ;;
+        aarch64 | arm64) cf_arch="arm64" ;;
+        armv7* | armhf) cf_arch="arm" ;;
+        i386 | i686) cf_arch="386" ;;
+        *)
+            echo -e "${red}Unsupported architecture for cloudflared: $(uname -m)${plain}"
+            return 1
+            ;;
+    esac
+    curl -fsSL --retry 3 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" -o /usr/local/bin/cloudflared
+    if [[ $? -ne 0 || ! -s /usr/local/bin/cloudflared ]]; then
+        echo -e "${red}Failed to download cloudflared binary.${plain}"
+        return 1
+    fi
+    chmod +x /usr/local/bin/cloudflared
+    ln -sf /usr/local/bin/cloudflared /usr/bin/cloudflared 2>/dev/null || true
+    echo -e "${green}cloudflared installed successfully!${plain}"
+    return 0
+}
+
+setup_cloudflare_tunnel() {
+    local panel_port="$1"
+    local web_base_path="$2"
+    if [[ -z "$panel_port" ]]; then
+        panel_port=$(${xray_folder}/x-ray setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
+        panel_port="${panel_port:-4523}"
+    fi
+    if [[ -z "$web_base_path" ]]; then
+        web_base_path=$(${xray_folder}/x-ray setting -show true 2>/dev/null | grep -Eo 'webBasePath: .+' | awk '{print $2}' | sed 's#^/##')
+    fi
+
+    install_cloudflared || return 1
+
+    echo ""
+    echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
+    echo -e "${green}        Cloudflare Tunnel Setup                            ${plain}"
+    echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
+    echo -e "Benefits of Cloudflare Tunnel:"
+    echo -e "  • ${green}Free official Cloudflare SSL certificate${plain}"
+    echo -e "  • ${green}Zero open ports needed on VPS (bypasses Port 80/443/Nginx conflicts)${plain}"
+    echo -e "  • ${green}DDoS protection, CDN acceleration, and Web Application Firewall${plain}"
+    echo ""
+    echo -e "  ${green}1.${plain} Auto-Login via Browser URL (Zero credentials required — Recommended)"
+    echo -e "  ${green}2.${plain} Connect using Cloudflare Zero Trust Tunnel Token"
+    echo -e "  ${green}0.${plain} Skip / Back"
+    echo ""
+    read -rp "Please enter choice [1-2]: " cf_choice
+
+    case "$cf_choice" in
+        1)
+            echo ""
+            echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
+            echo -e "${yellow}           Cloudflare Tunnel Auto-Login                    ${plain}"
+            echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
+            echo -e "1. Below you will see an authorization URL."
+            echo -e "2. Copy and open the link in your browser."
+            echo -e "3. Select your domain (e.g. digitaltv.lk) and click 'Authorize'."
+            echo -e "4. As soon as you click Authorize, the terminal will auto-continue!"
+            echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
+            echo ""
+
+            if [[ -f ~/.cloudflared/cert.pem || -f /etc/cloudflared/cert.pem ]]; then
+                read -rp "Existing Cloudflare login session found. Use existing authorization? [Y/n]: " use_existing_auth
+                if [[ "$use_existing_auth" =~ ^[nN]$ ]]; then
+                    rm -f ~/.cloudflared/cert.pem /etc/cloudflared/cert.pem
+                    cloudflared tunnel login
+                fi
+            else
+                cloudflared tunnel login
+            fi
+
+            local cert_path=""
+            if [[ -f ~/.cloudflared/cert.pem ]]; then
+                cert_path=~/.cloudflared/cert.pem
+            elif [[ -f /etc/cloudflared/cert.pem ]]; then
+                cert_path=/etc/cloudflared/cert.pem
+            fi
+
+            if [[ -z "$cert_path" ]]; then
+                echo -e "${red}Login authorization was not completed. Please try again.${plain}"
+                return 1
+            fi
+            echo -e "${green}✓ Cloudflare authorization successful!${plain}"
+            echo ""
+
+            local tunnel_domain=""
+            read -rp "Please enter your domain or subdomain for the panel (e.g. vpn.digitaltv.lk): " tunnel_domain
+            tunnel_domain="${tunnel_domain// /}"
+            if [[ -z "$tunnel_domain" ]]; then
+                echo -e "${red}Domain cannot be empty.${plain}"
+                return 1
+            fi
+
+            local tunnel_name="xray-panel-tunnel"
+            echo -e "${green}Configuring tunnel '${tunnel_name}'...${plain}"
+            cloudflared tunnel delete -f "$tunnel_name" > /dev/null 2>&1 || true
+            local tunnel_output=$(cloudflared tunnel create "$tunnel_name" 2>&1)
+            local tunnel_id=$(echo "$tunnel_output" | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1)
+            if [[ -z "$tunnel_id" ]]; then
+                tunnel_id=$(cloudflared tunnel list 2>&1 | grep "$tunnel_name" | awk '{print $1}')
+            fi
+
+            if [[ -z "$tunnel_id" ]]; then
+                echo -e "${red}Failed to create tunnel. Output:${plain}"
+                echo "$tunnel_output"
+                return 1
+            fi
+            echo -e "${green}✓ Tunnel created with ID: ${tunnel_id}${plain}"
+
+            echo -e "${green}Routing Cloudflare DNS for ${tunnel_domain}...${plain}"
+            cloudflared tunnel route dns --overwrite-dns "$tunnel_name" "$tunnel_domain"
+
+            mkdir -p /etc/cloudflared
+            local cred_src="/root/.cloudflared/${tunnel_id}.json"
+            if [[ ! -f "$cred_src" ]]; then
+                cred_src=$(find /root/.cloudflared /etc/cloudflared -name "${tunnel_id}.json" 2>/dev/null | head -n1)
+            fi
+            if [[ -n "$cred_src" && -f "$cred_src" ]]; then
+                cp -f "$cred_src" "/etc/cloudflared/${tunnel_id}.json" 2>/dev/null || true
+            fi
+
+            cat > /etc/cloudflared/config.yml <<EOF
+tunnel: ${tunnel_id}
+credentials-file: /etc/cloudflared/${tunnel_id}.json
+
+ingress:
+  - hostname: ${tunnel_domain}
+    service: http://127.0.0.1:${panel_port}
+  - service: http_status:404
+EOF
+
+            echo -e "${green}Installing cloudflared service...${plain}"
+            cloudflared service uninstall > /dev/null 2>&1 || true
+            cloudflared --config /etc/cloudflared/config.yml service install > /dev/null 2>&1 || true
+            systemctl daemon-reload
+            systemctl enable cloudflared
+            systemctl restart cloudflared
+
+            sleep 2
+            if systemctl is-active --quiet cloudflared; then
+                echo ""
+                echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
+                echo -e "${green}  ✓ Cloudflare Tunnel is LIVE and ACTIVE!                  ${plain}"
+                echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
+                echo -e "${green}Access URL: https://${tunnel_domain}/${web_base_path}${plain}"
+                echo -e "${yellow}• SSL is 100% active with green padlock via Cloudflare CDN.${plain}"
+                echo -e "${yellow}• Port 80 and port ${panel_port} do NOT need to be exposed externally!${plain}"
+                echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
+                SSL_SCHEME="https"
+                SSL_HOST="${tunnel_domain}"
+                IS_CF_TUNNEL="true"
+                return 0
+            else
+                echo -e "${yellow}Tunnel service installed. Checking status...${plain}"
+                systemctl status cloudflared --no-pager
+                return 0
+            fi
+            ;;
+        2)
+            echo ""
+            local cf_token=""
+            read -rp "Please enter your Cloudflare Tunnel Token (eyJh...): " cf_token
+            cf_token="${cf_token// /}"
+            if [[ -z "$cf_token" ]]; then
+                echo -e "${red}Token cannot be empty.${plain}"
+                return 1
+            fi
+            cloudflared service uninstall > /dev/null 2>&1 || true
+            cloudflared service install "$cf_token"
+            systemctl daemon-reload
+            systemctl enable cloudflared
+            systemctl restart cloudflared
+            echo -e "${green}✓ Cloudflare Tunnel installed and active with Token!${plain}"
+            IS_CF_TUNNEL="true"
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ssl_cert_issue_CF() {
+    echo -e "${green}═══════════════════════════════════════════${plain}"
+    echo -e "${green}     Cloudflare DNS API SSL Setup          ${plain}"
+    echo -e "${green}═══════════════════════════════════════════${plain}"
+    echo -e "Requires Cloudflare API Token (Zone:DNS:Edit) or Global API Key + email."
+    echo -e "${yellow}No port 80 is required for this method.${plain}"
+    echo ""
+
+    if ! command -v ~/.acme.sh/acme.sh &> /dev/null; then
+        echo "acme.sh could not be found. We will install it."
+        install_acme || return 1
+    fi
+
+    local CF_Domain=""
+    read -rp "Please enter your domain (e.g. digitaltv.lk or vpn.digitaltv.lk): " CF_Domain
+    CF_Domain="${CF_Domain// /}"
+    [[ -z "$CF_Domain" ]] && return 1
+
+    local CF_KeyType=""
+    read -rp "Are you using a Cloudflare API Token or Global API Key? (t/g) [Default t]: " CF_KeyType
+    CF_KeyType=${CF_KeyType:-t}
+
+    if [[ "$CF_KeyType" == "g" || "$CF_KeyType" == "G" ]]; then
+        local CF_GlobalKey=""
+        local CF_AccountEmail=""
+        read -rp "Please enter your Global API Key: " CF_GlobalKey
+        read -rp "Please enter your registered Cloudflare email: " CF_AccountEmail
+        export CF_Key="${CF_GlobalKey// /}"
+        export CF_Email="${CF_AccountEmail// /}"
+    else
+        local CF_ApiToken=""
+        read -rp "Please enter your Cloudflare API Token: " CF_ApiToken
+        export CF_Token="${CF_ApiToken// /}"
+    fi
+
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt --force
+    echo -e "${green}Issuing certificate via Cloudflare DNS...${plain}"
+    ~/.acme.sh/acme.sh --issue --dns dns_cf -d "${CF_Domain}" --log --force
+    if [[ $? -ne 0 ]]; then
+        echo -e "${red}Cloudflare DNS certificate issuance failed.${plain}"
+        return 1
+    fi
+
+    local certPath="/root/cert/${CF_Domain}"
+    rm -rf "${certPath}"
+    mkdir -p "${certPath}"
+
+    ~/.acme.sh/acme.sh --installcert --force -d "${CF_Domain}" \
+        --key-file "${certPath}/privkey.pem" \
+        --fullchain-file "${certPath}/fullchain.pem" \
+        --reloadcmd "systemctl restart x-ray || rc-service x-ray restart"
+
+    ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+    chmod 600 "${certPath}/privkey.pem"
+    chmod 644 "${certPath}/fullchain.pem"
+
+    ${xray_folder}/x-ray cert -webCert "${certPath}/fullchain.pem" -webCertKey "${certPath}/privkey.pem"
+    echo -e "${green}✓ Certificate paths configured for panel!${plain}"
+    SSL_HOST="${CF_Domain}"
+    SSL_SCHEME="https"
+    systemctl restart x-ray > /dev/null 2>&1 || rc-service x-ray restart > /dev/null 2>&1
+    return 0
+}
 # Unified interactive SSL setup (domain or IP)
 # Sets global `SSL_HOST` to the chosen domain/IP
 prompt_and_setup_ssl() {
@@ -625,24 +878,37 @@ prompt_and_setup_ssl() {
     local server_ip="$3"
 
     local ssl_choice=""
+    IS_CF_TUNNEL="false"
 
-    echo -e "${yellow}Choose SSL certificate setup method:${plain}"
-    echo -e "${green}1.${plain} Let's Encrypt for Domain (90-day validity, auto-renews)"
-    echo -e "${green}2.${plain} Let's Encrypt for IP Address (6-day validity, auto-renews)"
-    echo -e "${green}3.${plain} Custom SSL Certificate (Path to existing files)"
-    echo -e "${green}4.${plain} Skip SSL (advanced — behind reverse proxy / SSH tunnel only)"
-    echo -e "${blue}Note:${plain} Options 1 & 2 require port 80 open. Option 3 requires manual paths."
-    echo -e "${blue}Note:${plain} Option 4 serves the panel over plain HTTP — only safe behind nginx/Caddy or an SSH tunnel."
-    read -rp "Choose an option (default 2 for IP): " ssl_choice
+    echo -e "${yellow}Choose SSL / Access setup method:${plain}"
+    echo -e "${green}1.${plain} Cloudflare Tunnel (RECOMMENDED — auto browser URL, zero port conflicts, free SSL)"
+    echo -e "${green}2.${plain} Let's Encrypt for Domain (90-day validity, requires port 80 open)"
+    echo -e "${green}3.${plain} Let's Encrypt for IP Address (6-day validity, requires port 80 open)"
+    echo -e "${green}4.${plain} Cloudflare DNS API (Direct wildcard SSL via API Key/Token, no port 80 conflict)"
+    echo -e "${green}5.${plain} Custom SSL Certificate (Path to existing files)"
+    echo -e "${green}6.${plain} Skip SSL (advanced — behind reverse proxy / SSH tunnel only)"
+    echo -e "${blue}Note:${plain} Option 1 gives instant Cloudflare SSL with zero open ports on VPS (bypasses Nginx port 80/443)."
+    echo -e "${blue}Note:${plain} Options 2 & 3 require port 80 open. Option 4 requires Cloudflare API token/key."
+    echo -e "${blue}Note:${plain} Option 6 serves the panel over plain HTTP — only safe behind nginx/Caddy or an SSH tunnel."
+    read -rp "Choose an option (default 1 for Cloudflare Tunnel): " ssl_choice
     ssl_choice="${ssl_choice// /}" # Trim whitespace
 
-    # Default to 2 (IP cert) if input is empty or invalid (not 1, 3 or 4)
-    if [[ "$ssl_choice" != "1" && "$ssl_choice" != "3" && "$ssl_choice" != "4" ]]; then
-        ssl_choice="2"
+    if [[ "$ssl_choice" != "1" && "$ssl_choice" != "2" && "$ssl_choice" != "3" && "$ssl_choice" != "4" && "$ssl_choice" != "5" && "$ssl_choice" != "6" ]]; then
+        ssl_choice="1"
     fi
 
     case "$ssl_choice" in
         1)
+            # User chose Cloudflare Tunnel option
+            if setup_cloudflare_tunnel "${panel_port}" "${web_base_path}"; then
+                IS_CF_TUNNEL="true"
+            else
+                echo -e "${yellow}Cloudflare Tunnel setup skipped. Falling back to HTTP.${plain}"
+                SSL_SCHEME="http"
+                SSL_HOST="${server_ip}"
+            fi
+            ;;
+        2)
             # User chose Let's Encrypt domain option
             echo -e "${green}Using Let's Encrypt for domain certificate...${plain}"
             if ssl_cert_issue; then
@@ -663,7 +929,7 @@ prompt_and_setup_ssl() {
                 SSL_HOST="${server_ip}"
             fi
             ;;
-        2)
+        3)
             # User chose Let's Encrypt IP certificate option
             echo -e "${green}Using Let's Encrypt for IP certificate (shortlived profile)...${plain}"
 
@@ -712,7 +978,17 @@ prompt_and_setup_ssl() {
             fi
 
             ;;
-        3)
+        4)
+            # User chose Cloudflare DNS API option
+            if ssl_cert_issue_CF; then
+                echo -e "${green}✓ Cloudflare DNS SSL configured.${plain}"
+            else
+                echo -e "${red}Cloudflare DNS SSL failed. Falling back to HTTP.${plain}"
+                SSL_SCHEME="http"
+                SSL_HOST="${server_ip}"
+            fi
+            ;;
+        5)
             # User chose Custom Paths (User Provided) option
             echo -e "${green}Using custom existing certificate...${plain}"
             local custom_cert=""
@@ -772,7 +1048,7 @@ prompt_and_setup_ssl() {
 
             systemctl restart x-ray > /dev/null 2>&1 || rc-service x-ray restart > /dev/null 2>&1
             ;;
-        4)
+        6)
             echo ""
             echo -e "${red}⚠ Panel will be installed WITHOUT SSL/TLS.${plain}"
             echo -e "${yellow}Login credentials and cookies will travel as plain HTTP.${plain}"
@@ -885,7 +1161,11 @@ config_after_update() {
         echo -e "${green}═══════════════════════════════════════════${plain}"
         echo -e "${green}     Panel Access Information              ${plain}"
         echo -e "${green}═══════════════════════════════════════════${plain}"
-        echo -e "${green}Access URL: https://${SSL_HOST}:${existing_port}/${existing_webBasePath}${plain}"
+        if [[ "$IS_CF_TUNNEL" == "true" ]]; then
+            echo -e "${green}Access URL: https://${SSL_HOST}/${existing_webBasePath}${plain}"
+        else
+            echo -e "${green}Access URL: https://${SSL_HOST}:${existing_port}/${existing_webBasePath}${plain}"
+        fi
         echo -e "${green}═══════════════════════════════════════════${plain}"
         echo -e "${yellow}⚠ SSL Certificate: Enabled and configured${plain}"
     else
