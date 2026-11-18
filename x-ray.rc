@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+command="/usr/local/x-ray/x-ray"
+command_background=true
+pidfile="/run/x-ray.pid"
+description="X-ray Service"
+procname="x-ray"
+depend() {
+    need net
+}
+start_pre(){
+    cd /usr/local/x-ray
+}
+reload() {
+  ebegin "Reloading ${RC_SVCNAME}"
+  kill -USR1 $(cat $pidfile)
+  eend $?
+}
