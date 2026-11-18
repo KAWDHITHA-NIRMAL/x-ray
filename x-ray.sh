@@ -1398,7 +1398,6 @@ ssl_cert_issue_main() {
     echo -e "${green}\t4.${plain} Show Existing Domains"
     echo -e "${green}\t5.${plain} Set Cert paths for the panel"
     echo -e "${green}\t6.${plain} Get SSL for IP Address (6-day cert, auto-renews)"
-    echo -e "${green}\t7.${plain} Cloudflare Tunnel (Auto URL Login / Token)"
     echo -e "${green}\t0.${plain} Back to Main Menu"
 
     read -rp "Choose an option: " choice
@@ -1408,10 +1407,6 @@ ssl_cert_issue_main() {
             ;;
         1)
             ssl_cert_issue
-            ssl_cert_issue_main
-            ;;
-        7)
-            setup_cloudflare_tunnel
             ssl_cert_issue_main
             ;;
         2)
@@ -2159,212 +2154,6 @@ ssl_cert_issue_CF() {
     else
         show_menu
     fi
-}
-
-install_cloudflared() {
-    if command -v cloudflared &> /dev/null; then
-        return 0
-    fi
-    echo -e "${yellow}Downloading & installing Cloudflare Tunnel (cloudflared)...${plain}"
-    local cf_arch=""
-    case "$(uname -m)" in
-        x86_64 | amd64) cf_arch="amd64" ;;
-        aarch64 | arm64) cf_arch="arm64" ;;
-        armv7* | armhf) cf_arch="arm" ;;
-        i386 | i686) cf_arch="386" ;;
-        *)
-            echo -e "${red}Unsupported architecture for cloudflared: $(uname -m)${plain}"
-            return 1
-            ;;
-    esac
-    curl -fsSL --retry 3 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" -o /usr/local/bin/cloudflared
-    if [[ $? -ne 0 || ! -s /usr/local/bin/cloudflared ]]; then
-        echo -e "${red}Failed to download cloudflared binary.${plain}"
-        return 1
-    fi
-    chmod +x /usr/local/bin/cloudflared
-    ln -sf /usr/local/bin/cloudflared /usr/bin/cloudflared 2>/dev/null || true
-    echo -e "${green}cloudflared installed successfully!${plain}"
-    return 0
-}
-
-setup_cloudflare_tunnel() {
-    local panel_port="$1"
-    local web_base_path="$2"
-    if [[ -z "$panel_port" ]]; then
-        panel_port=$(${xray_folder}/x-ray setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
-        panel_port="${panel_port:-4523}"
-    fi
-    if [[ -z "$web_base_path" ]]; then
-        web_base_path=$(${xray_folder}/x-ray setting -show true 2>/dev/null | grep -Eo 'webBasePath: .+' | awk '{print $2}' | sed 's#^/##')
-    fi
-
-    install_cloudflared || return 1
-
-    echo ""
-    echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
-    echo -e "${green}        Cloudflare Tunnel Management                       ${plain}"
-    echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
-    echo -e "Benefits of Cloudflare Tunnel:"
-    echo -e "  • ${green}Free official Cloudflare SSL certificate${plain}"
-    echo -e "  • ${green}Zero open ports needed on VPS (bypasses Port 80/443/Nginx conflicts)${plain}"
-    echo -e "  • ${green}DDoS protection, CDN acceleration, and Web Application Firewall${plain}"
-    echo ""
-    echo -e "  ${green}1.${plain} Auto-Login via Browser URL (Zero credentials required — Recommended)"
-    echo -e "  ${green}2.${plain} Connect using Cloudflare Zero Trust Tunnel Token"
-    echo -e "  ${green}3.${plain} Check Tunnel Status"
-    echo -e "  ${green}4.${plain} Restart Tunnel Service"
-    echo -e "  ${green}5.${plain} Uninstall Cloudflare Tunnel"
-    echo -e "  ${green}0.${plain} Back to Main Menu"
-    echo ""
-    read -rp "Please enter choice [0-5]: " cf_choice
-
-    case "$cf_choice" in
-        1)
-            echo ""
-            echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
-            echo -e "${yellow}           Cloudflare Tunnel Auto-Login                    ${plain}"
-            echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
-            echo -e "1. Below you will see an authorization URL."
-            echo -e "2. Copy and open the link in your browser."
-            echo -e "3. Select your domain (e.g. digitaltv.lk) and click 'Authorize'."
-            echo -e "4. As soon as you click Authorize, the terminal will auto-continue!"
-            echo -e "${yellow}═══════════════════════════════════════════════════════════${plain}"
-            echo ""
-
-            # Check if cert.pem already exists
-            if [[ -f ~/.cloudflared/cert.pem || -f /etc/cloudflared/cert.pem ]]; then
-                read -rp "Existing Cloudflare login session found. Use existing authorization? [Y/n]: " use_existing_auth
-                if [[ "$use_existing_auth" =~ ^[nN]$ ]]; then
-                    rm -f ~/.cloudflared/cert.pem /etc/cloudflared/cert.pem
-                    cloudflared tunnel login
-                fi
-            else
-                cloudflared tunnel login
-            fi
-
-            local cert_path=""
-            if [[ -f ~/.cloudflared/cert.pem ]]; then
-                cert_path=~/.cloudflared/cert.pem
-            elif [[ -f /etc/cloudflared/cert.pem ]]; then
-                cert_path=/etc/cloudflared/cert.pem
-            fi
-
-            if [[ -z "$cert_path" ]]; then
-                echo -e "${red}Login authorization was not completed. Please try again.${plain}"
-                return 1
-            fi
-            echo -e "${green}✓ Cloudflare authorization successful!${plain}"
-            echo ""
-
-            local tunnel_domain=""
-            read -rp "Please enter your domain or subdomain for the panel (e.g. vpn.digitaltv.lk): " tunnel_domain
-            tunnel_domain="${tunnel_domain// /}"
-            if [[ -z "$tunnel_domain" ]]; then
-                echo -e "${red}Domain cannot be empty.${plain}"
-                return 1
-            fi
-
-            local tunnel_name="xray-panel-tunnel"
-            echo -e "${green}Configuring tunnel '${tunnel_name}'...${plain}"
-            cloudflared tunnel delete -f "$tunnel_name" > /dev/null 2>&1 || true
-            local tunnel_output=$(cloudflared tunnel create "$tunnel_name" 2>&1)
-            local tunnel_id=$(echo "$tunnel_output" | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -n1)
-            if [[ -z "$tunnel_id" ]]; then
-                tunnel_id=$(cloudflared tunnel list 2>&1 | grep "$tunnel_name" | awk '{print $1}')
-            fi
-
-            if [[ -z "$tunnel_id" ]]; then
-                echo -e "${red}Failed to create tunnel. Output:${plain}"
-                echo "$tunnel_output"
-                return 1
-            fi
-            echo -e "${green}✓ Tunnel created with ID: ${tunnel_id}${plain}"
-
-            echo -e "${green}Routing Cloudflare DNS for ${tunnel_domain}...${plain}"
-            cloudflared tunnel route dns --overwrite-dns "$tunnel_name" "$tunnel_domain"
-
-            mkdir -p /etc/cloudflared
-            local cred_src="/root/.cloudflared/${tunnel_id}.json"
-            if [[ ! -f "$cred_src" ]]; then
-                cred_src=$(find /root/.cloudflared /etc/cloudflared -name "${tunnel_id}.json" 2>/dev/null | head -n1)
-            fi
-            if [[ -n "$cred_src" && -f "$cred_src" ]]; then
-                cp -f "$cred_src" "/etc/cloudflared/${tunnel_id}.json" 2>/dev/null || true
-            fi
-
-            cat > /etc/cloudflared/config.yml <<EOF
-tunnel: ${tunnel_id}
-credentials-file: /etc/cloudflared/${tunnel_id}.json
-
-ingress:
-  - hostname: ${tunnel_domain}
-    service: http://127.0.0.1:${panel_port}
-  - service: http_status:404
-EOF
-
-            echo -e "${green}Installing cloudflared service...${plain}"
-            cloudflared service uninstall > /dev/null 2>&1 || true
-            cloudflared --config /etc/cloudflared/config.yml service install > /dev/null 2>&1 || true
-            systemctl daemon-reload
-            systemctl enable cloudflared
-            systemctl restart cloudflared
-
-            sleep 2
-            if systemctl is-active --quiet cloudflared; then
-                echo ""
-                echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
-                echo -e "${green}  ✓ Cloudflare Tunnel is LIVE and ACTIVE!                  ${plain}"
-                echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
-                echo -e "${green}Access URL: https://${tunnel_domain}/${web_base_path}${plain}"
-                echo -e "${yellow}• SSL is 100% active with green padlock via Cloudflare CDN.${plain}"
-                echo -e "${yellow}• Port 80 and port ${panel_port} do NOT need to be exposed externally!${plain}"
-                echo -e "${green}═══════════════════════════════════════════════════════════${plain}"
-                SSL_SCHEME="https"
-                SSL_HOST="${tunnel_domain}"
-            else
-                echo -e "${yellow}Tunnel service installed. Checking status...${plain}"
-                systemctl status cloudflared --no-pager
-            fi
-            return 0
-            ;;
-        2)
-            echo ""
-            local cf_token=""
-            read -rp "Please enter your Cloudflare Tunnel Token (eyJh...): " cf_token
-            cf_token="${cf_token// /}"
-            if [[ -z "$cf_token" ]]; then
-                echo -e "${red}Token cannot be empty.${plain}"
-                return 1
-            fi
-            cloudflared service uninstall > /dev/null 2>&1 || true
-            cloudflared service install "$cf_token"
-            systemctl daemon-reload
-            systemctl enable cloudflared
-            systemctl restart cloudflared
-            echo -e "${green}✓ Cloudflare Tunnel installed and active with Token!${plain}"
-            return 0
-            ;;
-        3)
-            echo ""
-            systemctl status cloudflared --no-pager
-            ;;
-        4)
-            echo ""
-            systemctl restart cloudflared
-            echo -e "${green}✓ Cloudflare Tunnel restarted.${plain}"
-            ;;
-        5)
-            echo ""
-            cloudflared service uninstall > /dev/null 2>&1 || true
-            systemctl stop cloudflared > /dev/null 2>&1 || true
-            rm -rf /etc/cloudflared
-            echo -e "${green}✓ Cloudflare Tunnel uninstalled.${plain}"
-            ;;
-        *)
-            return 0
-            ;;
-    esac
 }
 
 run_speedtest() {
@@ -3673,7 +3462,7 @@ show_usage() {
 show_menu() {
     echo -e "
 ╔────────────────────────────────────────────────╗
-│  ${green}X-ray Panel Management Script (v1.0.0)${plain}        │
+│  ${green}X-ray Panel Management Script (v1.0.2)${plain}        │
 │  ${green}Developer: Kawditha Nirmal${plain}                   │
 │  ${green}Website: https://x-ray.kawditha.dev${plain}          │
 │────────────────────────────────────────────────│
@@ -3703,20 +3492,19 @@ show_menu() {
 │  ${green}19.${plain} Disable Autostart                        │
 │────────────────────────────────────────────────│
 │  ${green}20.${plain} SSL Certificate Management               │
-│  ${green}21.${plain} Cloudflare SSL Certificate (DNS API)     │
-│  ${green}22.${plain} Cloudflare Tunnel Management (Auto URL)  │
-│  ${green}23.${plain} IP Limit Management                      │
-│  ${green}24.${plain} Firewall Management                      │
-│  ${green}25.${plain} SSH Port Forwarding Management           │
-│  ${green}26.${plain} PostgreSQL Management                    │
+│  ${green}21.${plain} Cloudflare SSL Certificate               │
+│  ${green}22.${plain} IP Limit Management                      │
+│  ${green}23.${plain} Firewall Management                      │
+│  ${green}24.${plain} SSH Port Forwarding Management           │
+│  ${green}25.${plain} PostgreSQL Management                    │
 │────────────────────────────────────────────────│
-│  ${green}27.${plain} Enable BBR                               │
-│  ${green}28.${plain} Update Geo Files                         │
-│  ${green}29.${plain} Speedtest by Ookla                       │
+│  ${green}26.${plain} Enable BBR                               │
+│  ${green}27.${plain} Update Geo Files                         │
+│  ${green}28.${plain} Speedtest by Ookla                       │
 ╚────────────────────────────────────────────────╝
 "
     show_status
-    echo && read -rp "Please enter your selection [0-29]: " num
+    echo && read -rp "Please enter your selection [0-28]: " num
 
     case "${num}" in
         0)
@@ -3786,31 +3574,28 @@ show_menu() {
             ssl_cert_issue_CF
             ;;
         22)
-            setup_cloudflare_tunnel
-            ;;
-        23)
             iplimit_main
             ;;
-        24)
+        23)
             firewall_menu
             ;;
-        25)
+        24)
             SSH_port_forwarding
             ;;
-        26)
+        25)
             postgresql_menu
             ;;
-        27)
+        26)
             bbr_menu
             ;;
-        28)
+        27)
             update_geo
             ;;
-        29)
+        28)
             run_speedtest
             ;;
         *)
-            LOGE "Please enter the correct number [0-29]"
+            LOGE "Please enter the correct number [0-28]"
             ;;
     esac
 }
