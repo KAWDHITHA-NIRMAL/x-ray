@@ -897,8 +897,7 @@ check_status() {
         if [[ ! -f ${xray_service}/x-ray.service ]]; then
             return 2
         fi
-        temp=$(systemctl status x-ray | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-        if [[ "${temp}" == "running" ]]; then
+        if systemctl is-active --quiet x-ray 2>/dev/null; then
             return 0
         else
             return 1
@@ -914,8 +913,7 @@ check_enabled() {
             return 1
         fi
     else
-        temp=$(systemctl is-enabled x-ray)
-        if [[ "${temp}" == "enabled" ]]; then
+        if systemctl is-enabled --quiet x-ray 2>/dev/null; then
             return 0
         else
             return 1
